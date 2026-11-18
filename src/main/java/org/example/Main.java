@@ -27,7 +27,7 @@ public class Main {
 
     private static boolean mappingPrinted;
 
-    // Simpan keluaran ke file sekaligus tetap tampilkan di terminal.
+    // Duplikasi keluaran ke terminal dan file log.
     public static void main(String[] args) throws IOException {
         Files.createDirectories(Path.of("output"));
         PrintStream terminal = System.out, terminalError = System.err;
@@ -64,7 +64,7 @@ public class Main {
     }
 
     private static String runScenario(String algorithm, int count) throws IOException {
-        // 1. Siapkan infrastruktur dan input. Objek baru untuk setiap skenario.
+        // 1. Inisialisasi infrastruktur dan dataset untuk setiap skenario.
         CloudSimPlus simulation = new CloudSimPlus();
         List<Datacenter> datacenters = createDatacenters(simulation);
         List<Vm> vms = createVms();
@@ -74,7 +74,7 @@ public class Main {
                 datacenters.get((int) Math.min(vm.getId() / VMS_PER_DC, DC_COUNT - 1)));
         broker.submitVmList(vms);
 
-        // 2. ACO/GWO mencari assignment dengan makespan model terkecil.
+        // 2. Pencarian assignment task ke VM.
         double[] lengths = tasks.stream().mapToDouble(Cloudlet::getLength).toArray();
         double[] mips = vms.stream().mapToDouble(Vm::getMips).toArray();
         int[] cores = vms.stream().mapToInt(vm -> (int) vm.getPesNumber()).toArray();
@@ -83,11 +83,11 @@ public class Main {
                 ? scheduler.runAco(ALGORITHM_SEED, POPULATION, ITERATIONS)
                 : scheduler.runGwo(ALGORITHM_SEED, POPULATION, ITERATIONS);
 
-        // 3. Terapkan assignment, lalu jalankan CloudSim dalam urutan dataset.
+        // 3. Binding task dan eksekusi CloudSim dalam urutan dataset.
         for (int task = 0; task < tasks.size(); task++)
             broker.bindCloudletToVm(tasks.get(task), vms.get(schedule.assignment()[task]));
         broker.submitCloudletList(tasks);
-        // Catat host saat alokasi: setelah simulasi VM bisa sudah dilepas dari host.
+        // Rekam alokasi sebelum VM dilepas dari host pada akhir simulasi.
         Map<Vm, Host> vmHosts = new IdentityHashMap<>();
         for (Vm vm : vms)
             vm.addOnHostAllocationListener(event -> vmHosts.put(event.getVm(), event.getHost()));
@@ -97,7 +97,7 @@ public class Main {
             mappingPrinted = true;
         }
 
-        // 4. Ambil hasil aktual. Jangan laporkan hasil jika ada task yang gagal.
+        // 4. Validasi penyelesaian task dan perhitungan metrik.
         List<Cloudlet> finished = broker.getCloudletFinishedList();
         if (finished.size() != count || finished.stream().anyMatch(task -> task.getStatus() != Cloudlet.Status.SUCCESS))
             throw new IllegalStateException("Task tidak selesai seluruhnya: " + finished.size() + "/" + count);
@@ -200,7 +200,7 @@ public class Main {
                 algorithm, count, prediction, makespan, gapPercent,
                 finished.size() / makespan, 100 * utilization / vms.size(), imbalance, cost);
     }
-    // close hanya melakukan flush agar terminal asli tidak ikut ditutup.
+    // Flush tanpa menutup stream terminal.
     private static class TeeOutputStream extends OutputStream {
         private final OutputStream terminal, file;
         TeeOutputStream(OutputStream terminal, OutputStream file) {
