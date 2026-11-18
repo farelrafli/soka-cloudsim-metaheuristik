@@ -1,5 +1,15 @@
 # Simulasi CloudSim Plus: ACO vs GWO (metaheuristik)
 
+## Kelompok
+
+Nama | NRP
+--- | ---
+Rizqi Akbar Sukirman Putra | 5027241044
+Muhammad Farrel Rafli Al Fasya | 5027241075
+Mohammad Abyan Ranuaji | 5027241106
+Yasykur Khalis Jati Maulana Yuwono | 5027241112
+Mohamad Arkan Zahir Asyafiq | 5027241120
+
 Simulasi penjadwalan task cloud dengan **Ant Colony Optimization (ACO)** dan **Grey Wolf Optimizer (GWO)** di
 CloudSim Plus 8.0.0, memakai dataset GoCJ (100 sampai 1000 task, kelipatan 100). Struktur project, infrastruktur,
 dan metrik mengikuti project referensi `SOKA-Heuristik` (Max-Min, Min-Min, FCFS).
