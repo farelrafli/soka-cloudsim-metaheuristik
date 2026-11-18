@@ -3,7 +3,7 @@ package org.example;
 import java.util.Arrays;
 import java.util.Random;
 
-/** Menghasilkan pembagian task ke VM. Tidak menjalankan simulasi CloudSim. */
+/** Penjadwalan task berbasis ACO dan GWO dengan objektif makespan. */
 public class MetaScheduler {
     public record Result(int[] assignment, double makespan, double[] bestHistory) {}
 
@@ -24,7 +24,7 @@ public class MetaScheduler {
         this.vmCores = vmCores.clone();
     }
 
-    // Satu angka untuk setiap task: assignment[task] = indeks VM yang dipilih.
+    // Evaluasi makespan dari assignment task ke VM.
     public double evaluate(int[] assignment) {
         if (assignment.length != taskLengths.length) throw new IllegalArgumentException("Jumlah assignment salah");
         double[][] finishTimes = emptyCoreTimes();
@@ -39,7 +39,7 @@ public class MetaScheduler {
         return makespan;
     }
 
-    // ---------------- ACO: coba jadwal, nilai jadwal, perbarui feromon. ----------------
+    // Ant Colony Optimization (ACO).
     public Result runAco(long seed, int ants, int iterations) {
         if (ants < 1 || iterations < 1) throw new IllegalArgumentException("Semut dan iterasi minimal 1");
         Random random = new Random(seed);
@@ -49,7 +49,7 @@ public class MetaScheduler {
         int[] bestAssignment = null;
         double bestMakespan = Double.MAX_VALUE;
 
-        // Sama dengan repo teman: Q = total MI / total kapasitas MIPS seluruh core.
+        // Skala deposit feromon: Q = total MI / total kapasitas MIPS.
         double totalLength = 0, totalCapacity = 0;
         for (double length : taskLengths) totalLength += length;
         for (int vm = 0; vm < vmMips.length; vm++) totalCapacity += vmMips[vm] * vmCores[vm];
@@ -85,7 +85,7 @@ public class MetaScheduler {
             for (int vm = 0; vm < vmMips.length; vm++) {
                 int core = earliestCore(finishTimes[vm]);
                 double completion = finishTimes[vm][core] + taskLengths[task] / vmMips[vm];
-                // alpha=1, beta=2: feromon tinggi dan waktu selesai kecil lebih disukai.
+                // Bobot pemilihan VM dengan alpha = 1 dan beta = 2.
                 weights[vm] = pheromone[task][vm] * Math.pow(1 / (1e-9 + completion), 2);
             }
             int vm = roulette(weights, random);
@@ -97,7 +97,7 @@ public class MetaScheduler {
     }
 
     private static int roulette(double[] weights, Random random) {
-        // Normalisasi dengan bobot terbesar, sama dengan repo teman.
+        // Normalisasi bobot dengan nilai maksimum.
         double max = Arrays.stream(weights).max().orElseThrow();
         double sum = 0;
         for (int vm = 0; vm < weights.length; vm++) {
@@ -115,7 +115,7 @@ public class MetaScheduler {
     private static void updatePheromone(double[][] pheromone, int[] iterationBest,
                                          int[] globalBest, double iterationDeposit, double globalDeposit) {
         for (int task = 0; task < pheromone.length; task++) {
-            // Penguapan 20%, lalu penguatan pilihan terbaik iterasi dan global.
+            // Evaporasi 20% dan deposit dari solusi terbaik iterasi serta global.
             for (int vm = 0; vm < pheromone[task].length; vm++)
                 pheromone[task][vm] = Math.max(0.01, pheromone[task][vm] * 0.8);
             pheromone[task][iterationBest[task]] += iterationDeposit;
@@ -125,7 +125,7 @@ public class MetaScheduler {
         }
     }
 
-    // ---------------- GWO: satu serigala mewakili satu kandidat jadwal. ----------------
+    // Grey Wolf Optimizer (GWO).
     public Result runGwo(long seed, int wolves, int iterations) {
         if (wolves < 3 || iterations < 1) throw new IllegalArgumentException("Serigala minimal 3, iterasi minimal 1");
         Random random = new Random(seed);
