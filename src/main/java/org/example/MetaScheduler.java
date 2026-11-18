@@ -3,180 +3,194 @@ package org.example;
 import java.util.Arrays;
 import java.util.Random;
 
-/**
- * ACO dan GWO untuk penjadwalan task independen ke VM (meminimalkan makespan).
- * Kelas ini murni Java (tanpa CloudSim) supaya bisa diuji terpisah.
- *
- * Model sama dengan referensi SOKA-Heuristik: tiap task butuh 1 PE, VM punya beberapa PE,
- * task pada satu VM dijalankan list-scheduling (PE yang paling cepat kosong), urutan = urutan dataset.
- * durasi(task, VM) = panjang task (MI) / MIPS VM.
- *
- * Parameter ACO/GWO mengikuti engine game (seed 42, 12 semut/serigala, 50 iterasi).
- * Catatan: PRNG berbeda dari game (java.util.Random vs Mulberry32), jadi hasil tidak identik bit-per-bit.
- */
-public final class MetaScheduler {
+/** Menghasilkan pembagian task ke VM. Tidak menjalankan simulasi CloudSim. */
+public class MetaScheduler {
+    public record Result(int[] assignment, double makespan, double[] bestHistory) {}
 
-    public static final class Result {
-        public final int[] assignment;
-        public final double makespan;
-        public final double[] bestHistory; // best-so-far per iterasi
+    private final double[] taskLengths;
+    private final double[] vmMips;
+    private final int[] vmCores;
 
-        Result(int[] assignment, double makespan, double[] bestHistory) {
-            this.assignment = assignment;
-            this.makespan = makespan;
-            this.bestHistory = bestHistory;
-        }
+    public MetaScheduler(double[] taskLengths, double[] vmMips, int[] vmCores) {
+        if (taskLengths.length == 0 || vmMips.length == 0 || vmMips.length != vmCores.length)
+            throw new IllegalArgumentException("Task/VM kosong atau ukuran MIPS dan core berbeda");
+        for (double length : taskLengths)
+            if (!Double.isFinite(length) || length <= 0) throw new IllegalArgumentException("Panjang task harus positif");
+        for (int vm = 0; vm < vmMips.length; vm++)
+            if (!Double.isFinite(vmMips[vm]) || vmMips[vm] <= 0 || vmCores[vm] <= 0)
+                throw new IllegalArgumentException("MIPS dan jumlah core harus positif");
+        this.taskLengths = taskLengths.clone();
+        this.vmMips = vmMips.clone();
+        this.vmCores = vmCores.clone();
     }
 
-    private final double[] len;   // panjang task (MI)
-    private final double[] mips;  // MIPS per VM
-    private final int[] offset;   // indeks awal PE tiap VM pada array flat
-    private final int n, m, totalPes;
-    private final double lowerBound;
-
-    public MetaScheduler(double[] taskLengthMI, double[] vmMips, int[] vmPes) {
-        this.len = taskLengthMI;
-        this.mips = vmMips;
-        this.n = taskLengthMI.length;
-        this.m = vmMips.length;
-        this.offset = new int[m + 1];
-        for (int j = 0; j < m; j++) offset[j + 1] = offset[j] + vmPes[j];
-        this.totalPes = offset[m];
-        double sum = 0, cap = 0;
-        for (double l : len) sum += l;
-        for (int j = 0; j < m; j++) cap += vmMips[j] * vmPes[j];
-        this.lowerBound = sum / cap; // makespan ideal bila beban terbagi sempurna
-    }
-
-    /** Makespan model untuk satu penugasan task -> VM (list scheduling pada PE terdekat kosong). */
+    // Satu angka untuk setiap task: assignment[task] = indeks VM yang dipilih.
     public double evaluate(int[] assignment) {
-        double[] avail = new double[totalPes];
+        if (assignment.length != taskLengths.length) throw new IllegalArgumentException("Jumlah assignment salah");
+        double[][] finishTimes = emptyCoreTimes();
         double makespan = 0;
-        for (int t = 0; t < n; t++) {
-            int j = assignment[t];
-            int best = offset[j];
-            for (int p = offset[j] + 1; p < offset[j + 1]; p++) if (avail[p] < avail[best]) best = p;
-            avail[best] += len[t] / mips[j];
-            if (avail[best] > makespan) makespan = avail[best];
+        for (int task = 0; task < taskLengths.length; task++) {
+            int vm = assignment[task];
+            if (vm < 0 || vm >= vmMips.length) throw new IllegalArgumentException("Indeks VM salah");
+            int core = earliestCore(finishTimes[vm]);
+            finishTimes[vm][core] += taskLengths[task] / vmMips[vm];
+            makespan = Math.max(makespan, finishTimes[vm][core]);
         }
         return makespan;
     }
 
-    // ------------------------------------------------------------------ ACO
-
+    // ---------------- ACO: coba jadwal, nilai jadwal, perbarui feromon. ----------------
     public Result runAco(long seed, int ants, int iterations) {
-        final double alpha = 1, beta = 2, rho = 0.2, tau0 = 1, tauMin = 0.01, tauMax = 10, globalBestWeight = 0.5;
-        // Pada game makespan ~6 s sehingga Q=1 cukup. Di dataset GoCJ makespan ribuan detik, deposit 1/makespan
-        // akan hilang tertelan evaporasi. Maka Q diskalakan ke lower bound: deposit = lowerBound / makespan (0..1].
-        final double Q = lowerBound;
-
-        Random rng = new Random(seed);
-        double[][] tau = new double[n][m];
-        for (double[] row : tau) Arrays.fill(row, tau0);
-
-        int[] globalBest = null;
-        double globalBestMk = Double.MAX_VALUE;
+        if (ants < 1 || iterations < 1) throw new IllegalArgumentException("Semut dan iterasi minimal 1");
+        Random random = new Random(seed);
+        double[][] pheromone = new double[taskLengths.length][vmMips.length];
+        for (double[] row : pheromone) Arrays.fill(row, 1);
         double[] history = new double[iterations];
-        double[] weights = new double[m];
+        int[] bestAssignment = null;
+        double bestMakespan = Double.MAX_VALUE;
 
-        for (int it = 0; it < iterations; it++) {
-            int[] iterBest = null;
-            double iterBestMk = Double.MAX_VALUE;
+        // Sama dengan repo teman: Q = total MI / total kapasitas MIPS seluruh core.
+        double totalLength = 0, totalCapacity = 0;
+        for (double length : taskLengths) totalLength += length;
+        for (int vm = 0; vm < vmMips.length; vm++) totalCapacity += vmMips[vm] * vmCores[vm];
+        double q = totalLength / totalCapacity;
 
+        for (int iteration = 0; iteration < iterations; iteration++) {
+            int[] iterationBest = null;
+            double iterationMakespan = Double.MAX_VALUE;
             for (int ant = 0; ant < ants; ant++) {
-                int[] a = new int[n];
-                double[] avail = new double[totalPes];
-                double[] minAvail = new double[m];
-                for (int t = 0; t < n; t++) {
-                    double max = 0;
-                    for (int j = 0; j < m; j++) {
-                        double completion = minAvail[j] + len[t] / mips[j];
-                        double w = Math.pow(tau[t][j], alpha) * Math.pow(1.0 / (1e-9 + completion), beta);
-                        weights[j] = w;
-                        if (w > max) max = w;
-                    }
-                    double sum = 0;
-                    for (int j = 0; j < m; j++) { weights[j] = max > 0 ? weights[j] / max : 1.0; sum += weights[j]; }
-                    double r = rng.nextDouble() * sum, acc = 0;
-                    int pick = m - 1;
-                    for (int j = 0; j < m; j++) { acc += weights[j]; if (r < acc) { pick = j; break; } }
-                    a[t] = pick;
-                    int best = offset[pick];
-                    for (int p = offset[pick] + 1; p < offset[pick + 1]; p++) if (avail[p] < avail[best]) best = p;
-                    avail[best] += len[t] / mips[pick];
-                    double mn = Double.MAX_VALUE;
-                    for (int p = offset[pick]; p < offset[pick + 1]; p++) mn = Math.min(mn, avail[p]);
-                    minAvail[pick] = mn;
+                int[] assignment = createAntSchedule(pheromone, random);
+                double makespan = evaluate(assignment);
+                if (makespan < iterationMakespan) {
+                    iterationBest = assignment;
+                    iterationMakespan = makespan;
                 }
-                double mk = evaluate(a);
-                if (mk < iterBestMk) { iterBestMk = mk; iterBest = a; }
-                if (mk < globalBestMk) { globalBestMk = mk; globalBest = a.clone(); }
+                if (makespan < bestMakespan) {
+                    bestAssignment = assignment;
+                    bestMakespan = makespan;
+                }
             }
-
-            // Evaporasi, deposit iteration-best (bobot 1) dan global-best (bobot 0.5), lalu clamp.
-            for (int t = 0; t < n; t++)
-                for (int j = 0; j < m; j++) tau[t][j] = Math.max(tauMin, tau[t][j] * (1 - rho));
-            double dIter = Q / iterBestMk, dGlobal = Q * globalBestWeight / globalBestMk;
-            for (int t = 0; t < n; t++) { tau[t][iterBest[t]] += dIter; tau[t][globalBest[t]] += dGlobal; }
-            for (int t = 0; t < n; t++)
-                for (int j = 0; j < m; j++) tau[t][j] = Math.max(tauMin, Math.min(tauMax, tau[t][j]));
-
-            history[it] = globalBestMk;
+            updatePheromone(pheromone, iterationBest, bestAssignment,
+                    q / iterationMakespan, 0.5 * q / bestMakespan);
+            history[iteration] = bestMakespan;
         }
-        return new Result(globalBest, globalBestMk, history);
+        return new Result(bestAssignment, bestMakespan, history);
     }
 
-    // ------------------------------------------------------------------ GWO
-
-    private int[] decode(double[] pos) {
-        int[] a = new int[n];
-        for (int t = 0; t < n; t++) a[t] = Math.max(0, Math.min(m - 1, (int) Math.floor(pos[t])));
-        return a;
+    private int[] createAntSchedule(double[][] pheromone, Random random) {
+        int[] assignment = new int[taskLengths.length];
+        double[][] finishTimes = emptyCoreTimes();
+        double[] weights = new double[vmMips.length];
+        for (int task = 0; task < taskLengths.length; task++) {
+            for (int vm = 0; vm < vmMips.length; vm++) {
+                int core = earliestCore(finishTimes[vm]);
+                double completion = finishTimes[vm][core] + taskLengths[task] / vmMips[vm];
+                // alpha=1, beta=2: feromon tinggi dan waktu selesai kecil lebih disukai.
+                weights[vm] = pheromone[task][vm] * Math.pow(1 / (1e-9 + completion), 2);
+            }
+            int vm = roulette(weights, random);
+            assignment[task] = vm;
+            int core = earliestCore(finishTimes[vm]);
+            finishTimes[vm][core] += taskLengths[task] / vmMips[vm];
+        }
+        return assignment;
     }
 
+    private static int roulette(double[] weights, Random random) {
+        // Normalisasi dengan bobot terbesar, sama dengan repo teman.
+        double max = Arrays.stream(weights).max().orElseThrow();
+        double sum = 0;
+        for (int vm = 0; vm < weights.length; vm++) {
+            weights[vm] = max > 0 ? weights[vm] / max : 1;
+            sum += weights[vm];
+        }
+        double target = random.nextDouble() * sum, cumulative = 0;
+        for (int vm = 0; vm < weights.length; vm++) {
+            cumulative += weights[vm];
+            if (target < cumulative) return vm;
+        }
+        return weights.length - 1;
+    }
+
+    private static void updatePheromone(double[][] pheromone, int[] iterationBest,
+                                         int[] globalBest, double iterationDeposit, double globalDeposit) {
+        for (int task = 0; task < pheromone.length; task++) {
+            // Penguapan 20%, lalu penguatan pilihan terbaik iterasi dan global.
+            for (int vm = 0; vm < pheromone[task].length; vm++)
+                pheromone[task][vm] = Math.max(0.01, pheromone[task][vm] * 0.8);
+            pheromone[task][iterationBest[task]] += iterationDeposit;
+            pheromone[task][globalBest[task]] += globalDeposit;
+            for (int vm = 0; vm < pheromone[task].length; vm++)
+                pheromone[task][vm] = Math.max(0.01, Math.min(10, pheromone[task][vm]));
+        }
+    }
+
+    // ---------------- GWO: satu serigala mewakili satu kandidat jadwal. ----------------
     public Result runGwo(long seed, int wolves, int iterations) {
-        Random rng = new Random(seed);
-        double[][] pos = new double[wolves][n];
-        double[] fit = new double[wolves];
-        for (int w = 0; w < wolves; w++) {
-            for (int t = 0; t < n; t++) pos[w][t] = rng.nextDouble() * m;
-            fit[w] = evaluate(decode(pos[w]));
-        }
-        int[] globalBest = null;
-        double globalBestMk = Double.MAX_VALUE;
-        for (int w = 0; w < wolves; w++)
-            if (fit[w] < globalBestMk) { globalBestMk = fit[w]; globalBest = decode(pos[w]); }
+        if (wolves < 3 || iterations < 1) throw new IllegalArgumentException("Serigala minimal 3, iterasi minimal 1");
+        Random random = new Random(seed);
+        double[][] positions = new double[wolves][taskLengths.length];
+        double[] fitness = new double[wolves];
+        int[] bestAssignment = null;
+        double bestMakespan = Double.MAX_VALUE;
         double[] history = new double[iterations];
 
-        for (int it = 1; it <= iterations; it++) {
-            Integer[] order = new Integer[wolves];
-            for (int w = 0; w < wolves; w++) order[w] = w;
-            final double[] f = fit;
-            Arrays.sort(order, (x, y) -> f[x] != f[y] ? Double.compare(f[x], f[y]) : Integer.compare(x, y));
-            double[][] leaders = { pos[order[0]], pos[order[1]], pos[order[2]] }; // alpha, beta, delta
-            double a = iterations == 1 ? 0 : 2.0 * (1 - (it - 1.0) / (iterations - 1));
-
-            double[][] next = new double[wolves][n];
-            for (int w = 0; w < wolves; w++) {
-                for (int t = 0; t < n; t++) {
-                    double total = 0, x = pos[w][t];
+        for (int wolf = 0; wolf < wolves; wolf++) {
+            for (int task = 0; task < taskLengths.length; task++)
+                positions[wolf][task] = random.nextDouble() * vmMips.length;
+            fitness[wolf] = evaluate(decode(positions[wolf]));
+            if (fitness[wolf] < bestMakespan) {
+                bestMakespan = fitness[wolf];
+                bestAssignment = decode(positions[wolf]);
+            }
+        }
+        for (int iteration = 0; iteration < iterations; iteration++) {
+            Integer[] ranking = new Integer[wolves];
+            for (int wolf = 0; wolf < wolves; wolf++) ranking[wolf] = wolf;
+            Arrays.sort(ranking, (x, y) -> Double.compare(fitness[x], fitness[y]));
+            double[][] leaders = {positions[ranking[0]], positions[ranking[1]], positions[ranking[2]]};
+            double a = iterations == 1 ? 0 : 2.0 * (1 - (double) iteration / (iterations - 1));
+            double[][] next = new double[wolves][taskLengths.length];
+            for (int wolf = 0; wolf < wolves; wolf++) {
+                for (int task = 0; task < taskLengths.length; task++) {
+                    double total = 0;
                     for (double[] leader : leaders) {
-                        double r1 = rng.nextDouble(), r2 = rng.nextDouble();
+                        double r1 = random.nextDouble(), r2 = random.nextDouble();
                         double A = 2 * a * r1 - a, C = 2 * r2;
-                        double dist = Math.abs(C * leader[t] - x);
-                        total += leader[t] - A * dist;
+                        double distance = Math.abs(C * leader[task] - positions[wolf][task]);
+                        total += leader[task] - A * distance;
                     }
-                    next[w][t] = Math.max(0, Math.min(m - 1e-9, total / 3));
+                    next[wolf][task] = Math.max(0, Math.min(vmMips.length - 1e-9, total / 3));
                 }
             }
-            pos = next;
-            for (int w = 0; w < wolves; w++) {
-                int[] dec = decode(pos[w]);
-                fit[w] = evaluate(dec);
-                if (fit[w] < globalBestMk) { globalBestMk = fit[w]; globalBest = dec; }
+            positions = next;
+            for (int wolf = 0; wolf < wolves; wolf++) {
+                int[] assignment = decode(positions[wolf]);
+                fitness[wolf] = evaluate(assignment);
+                if (fitness[wolf] < bestMakespan) {
+                    bestMakespan = fitness[wolf];
+                    bestAssignment = assignment;
+                }
             }
-            history[it - 1] = globalBestMk;
+            history[iteration] = bestMakespan;
         }
-        return new Result(globalBest, globalBestMk, history);
+        return new Result(bestAssignment, bestMakespan, history);
+    }
+
+    private int[] decode(double[] position) {
+        int[] assignment = new int[position.length];
+        for (int task = 0; task < position.length; task++)
+            assignment[task] = Math.max(0, Math.min(vmMips.length - 1, (int) Math.floor(position[task])));
+        return assignment;
+    }
+    private double[][] emptyCoreTimes() {
+        double[][] times = new double[vmCores.length][];
+        for (int vm = 0; vm < vmCores.length; vm++) times[vm] = new double[vmCores[vm]];
+        return times;
+    }
+    private static int earliestCore(double[] times) {
+        int best = 0;
+        for (int core = 1; core < times.length; core++) if (times[core] < times[best]) best = core;
+        return best;
     }
 }
