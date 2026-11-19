@@ -65,10 +65,10 @@ public class Main {
 
     private static final double COST_PER_MIPS_SEC = 0.00001;
 
-    // Parameter metaheuristik (sama dengan engine game): seed 42, 12 semut/serigala, 50 iterasi
+    // Parameter metaheuristik hasil tuning (lihat Tuning.java dan output/parameter_terpilih.txt)
     private static final long ALGO_SEED = 42;
-    private static final int POPULATION = 12;
-    private static final int ITERATIONS = 50;
+    private static final int ACO_POPULATION = 20, ACO_ITERATIONS = 100;
+    private static final int GWO_POPULATION = 50, GWO_ITERATIONS = 25;
     private static final double GAP_WARN_RATIO = 0.01;
 
     private static final List<String> csvRows = new ArrayList<>();
@@ -263,12 +263,12 @@ public class Main {
     }
 
     private static ScheduleResult acoSchedule(List<Cloudlet> cloudlets, List<Vm> vms) {
-        MetaScheduler.Result r = newScheduler(cloudlets, vms).runAco(ALGO_SEED, POPULATION, ITERATIONS);
+        MetaScheduler.Result r = newScheduler(cloudlets, vms).runAco(ALGO_SEED, ACO_POPULATION, ACO_ITERATIONS);
         return toScheduleResult(cloudlets, vms, r);
     }
 
     private static ScheduleResult gwoSchedule(List<Cloudlet> cloudlets, List<Vm> vms) {
-        MetaScheduler.Result r = newScheduler(cloudlets, vms).runGwo(ALGO_SEED, POPULATION, ITERATIONS);
+        MetaScheduler.Result r = newScheduler(cloudlets, vms).runGwo(ALGO_SEED, GWO_POPULATION, GWO_ITERATIONS);
         return toScheduleResult(cloudlets, vms, r);
     }
 

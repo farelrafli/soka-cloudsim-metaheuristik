@@ -1,0 +1,4 @@
+ACO: populasi=20, iterasi=100 (evaluasi=2000, skor=1.6608 +- 0.0119 antar seed)
+   skor terbaik mutlak: populasi=30, iterasi=100 (evaluasi=3000, skor=1.6452)
+GWO: populasi=50, iterasi=25 (evaluasi=1300, skor=2.6071 +- 0.0556 antar seed)
+   skor terbaik mutlak: populasi=50, iterasi=25 (evaluasi=1300, skor=2.6071)

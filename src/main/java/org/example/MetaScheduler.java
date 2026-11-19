@@ -179,4 +179,9 @@ public final class MetaScheduler {
         }
         return new Result(globalBest, globalBestMk, history);
     }
+
+    /** Makespan ideal (total MI / total kapasitas MIPS); dipakai untuk menormalkan hasil tuning. */
+    public double lowerBound() {
+        return lowerBound;
+    }
 }
