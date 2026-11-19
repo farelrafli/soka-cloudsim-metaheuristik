@@ -1,6 +1,7 @@
 package org.example;
 
 import ch.qos.logback.classic.Level;
+import ch.qos.logback.classic.Logger;
 import org.cloudsimplus.allocationpolicies.VmAllocationPolicySimple;
 import org.cloudsimplus.brokers.DatacenterBrokerSimple;
 import org.cloudsimplus.cloudlets.*;
@@ -13,6 +14,7 @@ import org.cloudsimplus.schedulers.vm.VmSchedulerTimeShared;
 import org.cloudsimplus.util.Log;
 import org.cloudsimplus.utilizationmodels.UtilizationModelDynamic;
 import org.cloudsimplus.vms.*;
+import org.slf4j.LoggerFactory;
 
 import java.io.*;
 import java.nio.charset.StandardCharsets;
@@ -21,19 +23,28 @@ import java.util.*;
 
 public class Main {
     private static final int DC_COUNT = 3, HOSTS_PER_DC = 5, VMS_PER_DC = 10;
-    private static final long HOST_SEED = 42, VM_SEED = 99, ALGORITHM_SEED = 42;
-    private static final int POPULATION = 12, ITERATIONS = 50;
+    private static final long HOST_SEED = 42, VM_SEED = 99;
     private static final double COST_PER_MIPS_SECOND = 0.00001;
+
+    // Daftar variasi parameter dinamis:
+    // Population: kelipatan 5 (misal: 5, 10, 15, 20)
+    // Iterations: kelipatan 20 (misal: 20, 40, 60, 80, 100)
+    // Seed: daftar seed eksperimen untuk uji konsistensi/reproduksibilitas
+    private static final int[] DEFAULT_POPULATIONS = { 5, 10, 15, 20 };
+    private static final int[] DEFAULT_ITERATIONS = { 20, 40, 60, 80, 100 };
+    private static final long[] DEFAULT_SEEDS = { 42L, 123L, 999L };
 
     private static boolean mappingPrinted;
 
     // Duplikasi keluaran ke terminal dan file log.
     public static void main(String[] args) throws IOException {
+        disableCloudSimLogs();
         Files.createDirectories(Path.of("output"));
         PrintStream terminal = System.out, terminalError = System.err;
         try (PrintStream file = new PrintStream("output/output_terminal.txt", StandardCharsets.UTF_8);
-             PrintStream output = new PrintStream(new TeeOutputStream(terminal, file), true, StandardCharsets.UTF_8);
-             PrintStream error = new PrintStream(new TeeOutputStream(terminalError, file), true, StandardCharsets.UTF_8)) {
+                PrintStream output = new PrintStream(new TeeOutputStream(terminal, file), true, StandardCharsets.UTF_8);
+                PrintStream error = new PrintStream(new TeeOutputStream(terminalError, file), true,
+                        StandardCharsets.UTF_8)) {
             System.setOut(output);
             System.setErr(error);
             run(args);
@@ -43,45 +54,129 @@ public class Main {
         }
     }
 
+    // Matikan seluruh log internal CloudSim Plus dan Logback/SLF4J.
+    private static void disableCloudSimLogs() {
+        Log.setLevel(Level.OFF);
+        if (LoggerFactory.getILoggerFactory() instanceof ch.qos.logback.classic.LoggerContext context) {
+            context.getLogger(Logger.ROOT_LOGGER_NAME).setLevel(Level.OFF);
+            context.getLogger("org.cloudsimplus").setLevel(Level.OFF);
+        }
+    }
+
+    /**
+     * Format argumen CLI (semua opsional):
+     * args[0] : task count ("all" atau 100..1000 kelipatan 100), default = "all"
+     * args[1] : daftar populasi kelipatan 5 dipisah koma (misal: "5,10,15,20"),
+     * default = DEFAULT_POPULATIONS
+     * args[2] : daftar iterasi kelipatan 20 dipisah koma (misal:
+     * "20,40,60,80,100"), default = DEFAULT_ITERATIONS
+     * args[3] : daftar seed dipisah koma (misal: "42,123,999"), default =
+     * DEFAULT_SEEDS
+     */
     private static void run(String[] args) throws IOException {
         mappingPrinted = false;
-        if (args.length > 1) throw new IllegalArgumentException("Gunakan: [all|100|200|...|1000]");
-        int selected = args.length == 0 || args[0].equals("all") ? 0 : Integer.parseInt(args[0]);
-        if (selected != 0 && (selected < 100 || selected > 1000 || selected % 100 != 0))
+        disableCloudSimLogs();
+        if (args.length > 4) {
+            throw new IllegalArgumentException(
+                    "Gunakan: [all|100..1000] [pop1,pop2,... (kelipatan 5)] [iter1,iter2,... (kelipatan 20)] [seed1,seed2,...]");
+        }
+
+        int selectedTask = (args.length == 0 || args[0].equalsIgnoreCase("all")) ? 0 : Integer.parseInt(args[0]);
+        if (selectedTask != 0 && (selectedTask < 100 || selectedTask > 1000 || selectedTask % 100 != 0)) {
             throw new IllegalArgumentException("Jumlah task harus 100..1000 kelipatan 100");
-        Log.setLevel(Level.INFO);
-        Files.createDirectories(Path.of("output"));
-        List<String> rows = new ArrayList<>();
-        rows.add("Algoritma,N_Task,Prediksi_Makespan,Makespan_Aktual,Gap_Persen,Throughput,Utilization_Persen,Imbalance,Total_Cost");
-        System.out.println("CloudSim: 3 DC, 15 host, 30 VM | seed=42, populasi=12, iterasi=50");
-        for (String algorithm : List.of("ACO", "GWO")) {
-            for (int count = 100; count <= 1000; count += 100) {
-                if (selected == 0 || selected == count) rows.add(runScenario(algorithm, count));
+        }
+
+        int[] populations = args.length >= 2 ? parseIntArray(args[1], "Population") : DEFAULT_POPULATIONS;
+        for (int pop : populations) {
+            if (pop < 5 || pop % 5 != 0) {
+                throw new IllegalArgumentException(
+                        "Parameter population harus kelipatan 5 (minimal 5), ditemukan: " + pop);
             }
         }
+
+        int[] iterationsList = args.length >= 3 ? parseIntArray(args[2], "Iterations") : DEFAULT_ITERATIONS;
+        for (int iter : iterationsList) {
+            if (iter < 20 || iter % 20 != 0) {
+                throw new IllegalArgumentException(
+                        "Parameter iteration harus kelipatan 20 (minimal 20), ditemukan: " + iter);
+            }
+        }
+
+        long[] seeds = args.length >= 4 ? parseLongArray(args[3], "Seed") : DEFAULT_SEEDS;
+
+        Files.createDirectories(Path.of("output"));
+        List<String> rows = new ArrayList<>();
+        rows.add(
+                "Algoritma,Seed,Population,Iterations,N_Task,Prediksi_Makespan,Makespan_Aktual,Gap_Persen,Throughput,Utilization_Persen,Imbalance,Total_Cost");
+
+        System.out.printf("CloudSim: 3 DC, 15 host, 30 VM | Populations=%s | Iterations=%s | Seeds=%s%n",
+                Arrays.toString(populations), Arrays.toString(iterationsList), Arrays.toString(seeds));
+
+        for (String algorithm : List.of("ACO", "GWO")) {
+            for (long seed : seeds) {
+                for (int population : populations) {
+                    for (int iterations : iterationsList) {
+                        for (int count = 100; count <= 1000; count += 100) {
+                            if (selectedTask == 0 || selectedTask == count) {
+                                rows.add(runScenario(algorithm, seed, population, iterations, count));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         Files.write(Path.of("output/hasil_metrik_perbandingan.csv"), rows, StandardCharsets.UTF_8);
         System.out.println("Hasil tersimpan di output/hasil_metrik_perbandingan.csv");
     }
 
-    private static String runScenario(String algorithm, int count) throws IOException {
+    private static int[] parseIntArray(String input, String label) {
+        String[] parts = input.split(",");
+        int[] values = new int[parts.length];
+        for (int i = 0; i < parts.length; i++) {
+            try {
+                values[i] = Integer.parseInt(parts[i].trim());
+            } catch (NumberFormatException e) {
+                throw new IllegalArgumentException("Format " + label + " tidak valid: " + parts[i]);
+            }
+        }
+        return values;
+    }
+
+    private static long[] parseLongArray(String input, String label) {
+        String[] parts = input.split(",");
+        long[] values = new long[parts.length];
+        for (int i = 0; i < parts.length; i++) {
+            try {
+                values[i] = Long.parseLong(parts[i].trim());
+            } catch (NumberFormatException e) {
+                throw new IllegalArgumentException("Format " + label + " tidak valid: " + parts[i]);
+            }
+        }
+        return values;
+    }
+
+    private static String runScenario(String algorithm, long seed, int population, int iterations, int count)
+            throws IOException {
         // 1. Inisialisasi infrastruktur dan dataset untuk setiap skenario.
         CloudSimPlus simulation = new CloudSimPlus();
         List<Datacenter> datacenters = createDatacenters(simulation);
         List<Vm> vms = createVms();
         List<Cloudlet> tasks = loadDataset(count);
         DatacenterBrokerSimple broker = new DatacenterBrokerSimple(simulation);
-        broker.setDatacenterMapper((defaultDc, vm) ->
-                datacenters.get((int) Math.min(vm.getId() / VMS_PER_DC, DC_COUNT - 1)));
+        broker.setDatacenterMapper(
+                (defaultDc, vm) -> datacenters.get((int) Math.min(vm.getId() / VMS_PER_DC, DC_COUNT - 1)));
         broker.submitVmList(vms);
 
-        // 2. Pencarian assignment task ke VM.
+        // 2. Pencarian assignment task ke VM dengan parameter dinamis (seed,
+        // population, iterations).
         double[] lengths = tasks.stream().mapToDouble(Cloudlet::getLength).toArray();
         double[] mips = vms.stream().mapToDouble(Vm::getMips).toArray();
         int[] cores = vms.stream().mapToInt(vm -> (int) vm.getPesNumber()).toArray();
         MetaScheduler scheduler = new MetaScheduler(lengths, mips, cores);
         MetaScheduler.Result schedule = algorithm.equals("ACO")
-                ? scheduler.runAco(ALGORITHM_SEED, POPULATION, ITERATIONS)
-                : scheduler.runGwo(ALGORITHM_SEED, POPULATION, ITERATIONS);
+                ? scheduler.runAco(seed, population, iterations)
+                : scheduler.runGwo(seed, population, iterations);
 
         // 3. Binding task dan eksekusi CloudSim dalam urutan dataset.
         for (int task = 0; task < tasks.size(); task++)
@@ -101,9 +196,11 @@ public class Main {
         List<Cloudlet> finished = broker.getCloudletFinishedList();
         if (finished.size() != count || finished.stream().anyMatch(task -> task.getStatus() != Cloudlet.Status.SUCCESS))
             throw new IllegalStateException("Task tidak selesai seluruhnya: " + finished.size() + "/" + count);
-        String row = calculateMetrics(algorithm, count, schedule.makespan(), finished, vms);
-        System.out.printf("%s | %d/%d task selesai | prediksi %.2f detik | aktual %.2f detik%n",
-                algorithm, finished.size(), count, schedule.makespan(),
+        String row = calculateMetrics(algorithm, seed, population, iterations, count, schedule.makespan(), finished,
+                vms);
+        System.out.printf(
+                "%s | seed=%d | pop=%d | iter=%d | %d/%d task selesai | prediksi %.2f detik | aktual %.2f detik%n",
+                algorithm, seed, population, iterations, finished.size(), count, schedule.makespan(),
                 finished.stream().mapToDouble(Cloudlet::getFinishTime).max().orElseThrow());
         return row;
     }
@@ -112,7 +209,8 @@ public class Main {
         System.out.println("\n=== PEMETAAN VM -> HOST -> DATACENTER ===");
         for (Vm vm : vms) {
             Host host = vmHosts.get(vm);
-            if (host == null) throw new IllegalStateException("Alokasi VM tidak tercatat: " + vm.getId());
+            if (host == null)
+                throw new IllegalStateException("Alokasi VM tidak tercatat: " + vm.getId());
             int dcNumber = datacenters.indexOf(host.getDatacenter()) + 1;
             System.out.printf("VM %2d -> Host %2d -> DC%d | MIPS %.0f | PE %d | RAM %d MB%n",
                     vm.getId(), host.getId(), dcNumber, vm.getMips(), vm.getPesNumber(), vm.getRam().getCapacity());
@@ -130,7 +228,8 @@ public class Main {
                 long mips = 1000 + random.nextInt(2001);
                 long ram = 4096 + random.nextInt(12289);
                 List<Pe> processingElements = new ArrayList<>();
-                for (int core = 0; core < cores; core++) processingElements.add(new PeSimple(mips));
+                for (int core = 0; core < cores; core++)
+                    processingElements.add(new PeSimple(mips));
                 Host machine = new HostSimple(ram, 10_000, 1_000_000, processingElements);
                 machine.setVmScheduler(new VmSchedulerTimeShared());
                 hosts.add(machine);
@@ -158,25 +257,29 @@ public class Main {
     private static List<Cloudlet> loadDataset(int count) throws IOException {
         String path = "/dataset/GoCJ_Dataset_" + count + ".txt";
         try (InputStream input = Main.class.getResourceAsStream(path)) {
-            if (input == null) throw new FileNotFoundException(path);
+            if (input == null)
+                throw new FileNotFoundException(path);
             BufferedReader reader = new BufferedReader(new InputStreamReader(input, StandardCharsets.UTF_8));
             List<Cloudlet> tasks = new ArrayList<>();
             for (String line; (line = reader.readLine()) != null;) {
-                if (line.isBlank()) continue;
+                if (line.isBlank())
+                    continue;
                 long length = Long.parseLong(line.trim());
-                if (length <= 0) throw new IllegalArgumentException("Panjang task harus positif");
+                if (length <= 0)
+                    throw new IllegalArgumentException("Panjang task harus positif");
                 Cloudlet task = new CloudletSimple(length, 1);
                 task.setFileSize(300).setOutputSize(300);
                 task.setUtilizationModelCpu(new UtilizationModelDynamic(1));
                 tasks.add(task);
             }
-            if (tasks.size() != count) throw new IllegalArgumentException("Jumlah task di dataset tidak cocok");
+            if (tasks.size() != count)
+                throw new IllegalArgumentException("Jumlah task di dataset tidak cocok");
             return tasks;
         }
     }
 
-    private static String calculateMetrics(String algorithm, int count, double prediction,
-                                           List<Cloudlet> finished, List<Vm> vms) {
+    private static String calculateMetrics(String algorithm, long seed, int population, int iterations,
+            int count, double prediction, List<Cloudlet> finished, List<Vm> vms) {
         double makespan = finished.stream().mapToDouble(Cloudlet::getFinishTime).max().orElseThrow();
         Map<Vm, Double> vmFinish = new HashMap<>(), vmBusy = new HashMap<>();
         for (Cloudlet task : finished) {
@@ -196,23 +299,37 @@ public class Main {
         double variance = Arrays.stream(finishTimes).map(time -> (time - mean) * (time - mean)).average().orElseThrow();
         double imbalance = Math.sqrt(variance);
         double gapPercent = Math.abs(makespan - prediction) / prediction * 100;
-        return String.format(Locale.US, "%s,%d,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f",
-                algorithm, count, prediction, makespan, gapPercent,
+        return String.format(Locale.US, "%s,%d,%d,%d,%d,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f",
+                algorithm, seed, population, iterations, count, prediction, makespan, gapPercent,
                 finished.size() / makespan, 100 * utilization / vms.size(), imbalance, cost);
     }
+
     // Flush tanpa menutup stream terminal.
     private static class TeeOutputStream extends OutputStream {
         private final OutputStream terminal, file;
+
         TeeOutputStream(OutputStream terminal, OutputStream file) {
             this.terminal = terminal;
             this.file = file;
         }
-        public void write(int value) throws IOException { terminal.write(value); file.write(value); }
+
+        public void write(int value) throws IOException {
+            terminal.write(value);
+            file.write(value);
+        }
+
         public void write(byte[] data, int offset, int length) throws IOException {
             terminal.write(data, offset, length);
             file.write(data, offset, length);
         }
-        public void flush() throws IOException { terminal.flush(); file.flush(); }
-        public void close() throws IOException { flush(); }
+
+        public void flush() throws IOException {
+            terminal.flush();
+            file.flush();
+        }
+
+        public void close() throws IOException {
+            flush();
+        }
     }
 }
